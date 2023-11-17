@@ -29,8 +29,6 @@ def show_wordcloud(data, stopwords, title = None, ax=None):
 
     ax.imshow(wordcloud)
 
-
-
 def filter_data(df, subjects=[], institutions=[], years=[0, 2022]):
     """Filter data for animated bar charts.
 
@@ -64,6 +62,100 @@ def filter_data(df, subjects=[], institutions=[], years=[0, 2022]):
 
     return df
 
+def preprocess_data3(df, subjects=[], institutions=[], stop_words=[], word_column='Title', all_lower=True):
+    """Preprocess data for animated bar charts.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Dataframe with data to be plotted.
+    subjects : str, optional
+        Subjects to be plotted.
+    stopwords : list, optional
+        Words to be removed from the plot.
+    word_coloumn : str, optional
+        Column name of the dataframe that contains the words to be plotted.
+    all_lower : bool, optional
+        If True, all words are converted to lowercase.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Preprocessed dataframe.
+    """
+    df_wc = filter_data(df, subjects, institutions)
+
+    # Lowercase words
+    if all_lower: 
+        df_wc[word_column] = df_wc[word_column].str.lower()
+
+    # Remove punctuation
+    import string 
+    df_wc['words'] = df_wc[word_column]
+    df_wc['words'] = df_wc['words'].str.replace('[{}]'.format(string.punctuation), '', regex=True)  
+
+    # Number of theses per year
+    thesis_per_year = df_wc['Year'].value_counts()
+    thesis_per_year=thesis_per_year.to_frame('Count').reset_index()
+    thesis_per_year.columns = ['Year', 'total_publications_that_year']  
+    thesis_per_year = thesis_per_year.sort_values(by='Year').reset_index(drop=True)
+    thesis_per_year['cumulative_pubs_over_time'] = thesis_per_year['total_publications_that_year'].transform('cumsum')
+
+
+    # Split words by space or punctuation
+    import re
+    df_wc['words'] = [list(filter(None, re.split('[ ,.!?-]|/|\\\\', x))) for x in df_wc['words'].values]
+    #df_wc['words'] = df_wc['words'].str.split('/\s*[\s-]\s*/') 
+    
+    # # Split words
+    # df_wc['words'] = df_wc['words'].str.split()
+
+    # get the unique words (this way we only count each word once per thesis, even if mentioned multiple times)
+    df_wc['words'] = df_wc['words'].apply(set)
+    df_wc = df_wc.explode('words')    
+
+    # remove plurals
+    import nltk
+    from nltk.stem.wordnet import WordNetLemmatizer
+    Lem = WordNetLemmatizer()
+    df_wc['words'] = [Lem.lemmatize(plural) for plural in df_wc['words']]   
+
+    # Add column for total number of times a word appears
+    df_wc['total_word_count'] = df_wc.groupby('words')['words'].transform('count')
+
+    # The number of times a word appears by year
+    df_long = df_wc[['Year', 'words']].value_counts().to_frame('counts').reset_index()
+
+    # Order by year
+    df_long = df_long.sort_values(by='Year').reset_index(drop=True)
+
+    # The number of times a word appears each year
+    #df_long['yearly_word_counts'] = df_long.groupby('words')['Year'].transform('count')
+
+    # match the thesis_per_year['cumulative_pubs_over_time'] column to the df_long dataframe
+    df_long = df_long.merge(thesis_per_year, on='Year')
+
+    # Add column for the cumulative number of theses
+    #df_long = df_long.sort_values(by='Year')
+    #df_long['cumulative_pubs_over_time'] = df_long.groupby('Year')['Year'].transform('count')
+
+    # The cumulative number of times a word appears 
+    df_long['cumulative_word_counts'] = df_long.groupby('words')['counts'].transform('cumsum')
+
+    # Remove stopwords and punctuation
+    if len(stop_words) > 0:
+        df_long = df_long.loc[~df_long['words'].str.lower().isin(stop_words)]
+    df_long['words'] = df_long['words'].str.replace('[{}]'.format(string.punctuation), '', regex=True)
+
+    # Ratio of word appearances to total number of theses
+    #df_long = df_long.merge(thesis_per_year, on='Year')
+    df_long['relative_frequency_of_word'] = 100 * df_long['cumulative_word_counts'] / df_long['cumulative_pubs_over_time']
+
+    df_long['relative_counts_that_year'] = 100 * df_long['counts'] / df_long['total_publications_that_year']
+    df_long['rolling_average'] = df_long.groupby('words')['relative_counts_that_year'].rolling(3, min_periods=1).mean().reset_index(0, drop=True)
+    
+
+    return df_long
 
 def preprocess_data2(df, subjects=[], institutions=[], stop_words=[], word_column='Title', all_lower=True):
     """Preprocess data for animated bar charts.
@@ -202,6 +294,61 @@ def preprocess_data(df, subjects=[], institutions=[], stop_words=[], word_column
     df_long['percentage_of_appearances'] = 100 * df_long['counts'] / df_long['total_publications']
 
     return df_long
+
+def plotly_animation2(df, n_appearances_threshold=50, n_words = 25, by_variance=True):
+    """Plot animated bar chart using plotly.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Dataframe with data to be plotted.
+    n_appearances_threshold : int, optional
+        Number of times a word must have appeared to be included 
+    n_words : int, optional
+        Maximum number of words to be plotted.
+    by_variance : bool, optional
+        If True, words are selected based on variance in percentage of appearances per year (
+        those which change the most over time selected). Else by the total number of appearances.
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Animated bar chart.
+    """
+    import pandas as pd
+    import plotly.express as px
+
+    # Remove words that appear less than n_appearances_threshold times
+    keep_words = df.loc[df['cumulative_word_counts'] >= n_appearances_threshold, 'words']
+    if len(keep_words) == 0:
+        # error message if no words meet the threshold
+        raise ValueError('No words meet the threshold of {} appearances, try reducing'.format(n_appearances_threshold))
+    df = df.loc[df['words'].isin(keep_words) ]
+
+    if by_variance: 
+        # Get the words with the highest variance in ratio of appearances
+        top_words = df.groupby('words')['relative_frequency_of_word'].var().sort_values(ascending=False).head(n_words).index
+    else: 
+        # Get the most popular unique words (n_words)
+        top_words = df.groupby('words')['counts'].sum().sort_values(ascending=False).head(n_words).index
+
+    range_max = max(df['relative_frequency_of_word'])
+
+    #df['key'] = df.groupby(['Year','words']).cumcount()
+    df = pd.pivot_table(df, index='Year', columns=['words'], values='relative_frequency_of_word')
+    df = df.stack(level=[0], dropna=False).reset_index()
+    df.columns=['Year', 'words', 'ratio']
+
+    df = df.loc[df['words'].isin(top_words)]
+    df['words'] = df['words'].astype('category')
+    df['words'] = df['words'].cat.reorder_categories(top_words)
+
+    # Plotting the data
+    fig = px.bar(df, x="words", y="ratio",  animation_frame="Year", range_y=[0, range_max])
+
+    fig.update_layout(xaxis={'title': 'Word', 'visible': True, 'showticklabels': True}, yaxis={'title': 'Ratio'})
+    fig.update_xaxes(categoryorder='array', categoryarray= top_words)
+
+    return fig
 
 def plotly_animation(df, n_overall=50, n_yearly=10, percentage_per_year=False, by_variance=True):
     """Plot animated bar chart using plotly.
